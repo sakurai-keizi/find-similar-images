@@ -21,11 +21,11 @@
 YOLOv8-pose で胴体・頭部の領域を検出する。胴体は両肩+両腰の4点、または両肩
 のみで上半身を推定。頭部は両目+両耳から推定。
 
-CLIP に渡す前に YOLOv8-seg で人物セグメンテーションマスクを生成し、人物以外
-のピクセルを中性色（グレー）に置き換える。これにより背景の影響を最小化する。
-マスク取得に失敗した場合は人物 bbox でクロップしただけの画像でフォールバック。
---no-mask を指定すると seg のロードと推論を完全にスキップし、人物 bbox の
-矩形クロップのみを CLIP に渡す（処理が軽くなる）。
+デフォルトでは人物 bbox の矩形クロップのみを CLIP に渡す（背景込み）。
+--mask を指定すると YOLOv8-seg で人物セグメンテーションマスクを生成し、
+人物以外のピクセルを中性色（グレー）に置き換えてから CLIP に渡す。これに
+より背景の影響を最小化できるが、seg モデルの追加ロードと推論コストが
+発生する。マスク取得に失敗した場合は矩形クロップにフォールバック。
 
 CLIP モデルは --clip-model で選択可能:
   - openai : 標準の OpenAI CLIP ViT-B/32（汎用）
@@ -51,8 +51,8 @@ CLIP モデルは --clip-model で選択可能:
 `{順序番号:04d}_{元のファイル名}` 形式（クラスタIDなし）で同じ階層に配置される。
 元のファイルは変更されない（コピーのみ）。
 
-初回実行時に YOLOv8-pose（~6MB）、YOLOv8-seg（~7MB）、CLIP ViT-B/32（~150MB）
-の重みが自動ダウンロードされる。
+初回実行時に YOLOv8-pose（~6MB）と CLIP ViT-B/32（~150MB）の重みが自動
+ダウンロードされる。--mask 指定時はさらに YOLOv8-seg（~7MB）も DL される。
 """
 
 import argparse
@@ -607,9 +607,9 @@ def main():
         help="CLIP 埋め込みから姿勢方向を除去する concept erasure を無効化する",
     )
     parser.add_argument(
-        "--no-mask",
+        "--mask",
         action="store_true",
-        help="背景除去（YOLOv8-seg によるマスク適用）を無効化する。CLIP には人物bboxの矩形クロップのみが渡される。",
+        help="背景除去（YOLOv8-seg によるマスク適用）を有効化する。デフォルトでは人物bboxの矩形クロップのみが CLIP に渡される。",
     )
     args = parser.parse_args()
 
@@ -631,7 +631,7 @@ def main():
     cluster_label = "自動" if args.clusters is None else str(args.clusters)
     console.print(f"  クラスタ数   : [cyan]{cluster_label}[/cyan]")
     erasure_label = "無効" if args.no_pose_erasure else "有効"
-    mask_label = "無効" if args.no_mask else "有効"
+    mask_label = "有効" if args.mask else "無効"
     console.print(
         f"  CLIP         : [cyan]{args.clip_model}[/cyan]  "
         f"姿勢消去: [cyan]{erasure_label}[/cyan]  "
@@ -650,11 +650,11 @@ def main():
     # ---- モデルロード ----
     with console.status("[bold green]YOLOv8-pose モデルを読み込み中..."):
         pose_model = load_pose_model()
-    if args.no_mask:
-        seg_model = None
-    else:
+    if args.mask:
         with console.status("[bold green]YOLOv8-seg モデルを読み込み中..."):
             seg_model = load_seg_model()
+    else:
+        seg_model = None
     clip_load_msg = (
         "CLIP モデルを読み込み中（初回はDLあり、~150MB）..."
         if args.clip_model == "openai"
