@@ -22,11 +22,17 @@ YOLOv8-pose で胴体・頭部・人物bboxを検出する。胴体は両肩+両
 両肩のみで上半身を推定。頭部は両目+両耳から推定。CLIPは人物bbox全体に適用
 し、服の種類（制服、スカート、水着など）や髪型のスタイルを意味的に捉える。
 
-3つの特徴ベクトルを各々 L2 正規化した上で重み付きで連結し、貪欲法の最近傍
-順序付け（NN-TSP）で1次元の順序を決定する。重みは --weight-torso /
---weight-hair / --weight-clip で調整可能。
+3つの特徴ベクトルを各々 L2 正規化した上で重み付きで連結する。重みは
+--weight-torso / --weight-hair / --weight-clip で調整可能。
 
-新しいファイル名は `{順序番号:04d}_{元のファイル名}` の形式。
+連結特徴量に対して K-means クラスタリングを行い、クラスタ重心同士の
+最近傍順序付け（NN-TSP）でクラスタ間を空間的に近い順に並べ、さらに
+各クラスタ内でも同じく NN 順序付けを行う。これにより「似たクラスタが
+隣接し、各クラスタ内でも似た画像が隣接する」2段の順序が得られる。
+クラスタ数は --clusters で指定可能（デフォルトは max(2, round(sqrt(N/2)))）。
+
+新しいファイル名は `{順序番号:04d}_c{クラスタID:02d}_{元のファイル名}` の形式。
+クラスタIDは並び順での通し番号（c01 が並び順の最初のクラスタ）。
 人物が検出できなかった画像は出力フォルダ内の `_no_person/` に元の名前のまま
 コピーされる。元のファイルは変更されない（コピーのみ）。
 
@@ -333,6 +339,93 @@ def greedy_nearest_neighbor_order(features: np.ndarray) -> list[int]:
     return order
 
 
+def kmeans(
+    features: np.ndarray, k: int, n_iter: int = 50, seed: int = 42
+) -> "tuple[np.ndarray, np.ndarray]":
+    """K-means++ 初期化付き K-means。labels (N,) と centers (K, D) を返す。"""
+    rng = np.random.default_rng(seed)
+    n = features.shape[0]
+    if k >= n:
+        return np.arange(n), features.copy()
+
+    # K-means++ 初期化
+    indices = [int(rng.integers(n))]
+    for _ in range(k - 1):
+        chosen = features[indices]
+        dists = np.linalg.norm(features[:, None] - chosen[None, :], axis=2).min(axis=1)
+        d2 = dists ** 2
+        s = float(d2.sum())
+        if s < 1e-12:
+            remaining = [i for i in range(n) if i not in indices]
+            if not remaining:
+                break
+            indices.append(remaining[0])
+            continue
+        probs = d2 / s
+        idx = int(rng.choice(n, p=probs))
+        if idx in indices:
+            remaining = [i for i in range(n) if i not in indices]
+            if not remaining:
+                break
+            idx = remaining[0]
+        indices.append(idx)
+    centers = features[indices].astype(np.float32).copy()
+
+    # Lloyd の反復
+    for _ in range(n_iter):
+        dists = np.linalg.norm(features[:, None] - centers[None, :], axis=2)
+        labels = dists.argmin(axis=1)
+        new_centers = np.empty_like(centers)
+        for i in range(centers.shape[0]):
+            mask = labels == i
+            if mask.any():
+                new_centers[i] = features[mask].mean(axis=0)
+            else:
+                # 空クラスタは外れ値で再初期化
+                new_centers[i] = features[int(rng.integers(n))]
+        if np.allclose(new_centers, centers, atol=1e-6):
+            centers = new_centers
+            break
+        centers = new_centers
+
+    dists = np.linalg.norm(features[:, None] - centers[None, :], axis=2)
+    labels = dists.argmin(axis=1)
+    return labels, centers
+
+
+def cluster_then_order(
+    features: np.ndarray, k: int
+) -> "tuple[list[tuple[int, int]], list[int]]":
+    """クラスタリング → クラスタ間NN → クラスタ内NN で2段の順序を作る。
+
+    Returns:
+        global_order: [(画像インデックス, 表示クラスタID(1-indexed))] のリスト
+        cluster_sizes: 表示クラスタIDの並び順での各クラスタのサイズ
+    """
+    if k <= 1 or features.shape[0] <= 1:
+        order = greedy_nearest_neighbor_order(features)
+        return [(idx, 1) for idx in order], [len(order)]
+
+    labels, centers = kmeans(features, k)
+    cluster_visit = greedy_nearest_neighbor_order(centers)
+
+    global_order: list[tuple[int, int]] = []
+    sizes: list[int] = []
+    for display_id, cluster_idx in enumerate(cluster_visit, start=1):
+        members = np.where(labels == cluster_idx)[0]
+        if len(members) == 0:
+            continue
+        if len(members) > 1:
+            sub_order = greedy_nearest_neighbor_order(features[members])
+            ordered_members = members[sub_order]
+        else:
+            ordered_members = members
+        for idx in ordered_members:
+            global_order.append((int(idx), display_id))
+        sizes.append(int(len(members)))
+    return global_order, sizes
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="服装・髪型が似ている順に並ぶようJPEG画像を新しい名前で別フォルダにコピーする",
@@ -366,6 +459,13 @@ def main():
         metavar="X",
         help=f"CLIP意味的特徴の重み（デフォルト: {DEFAULT_W_CLIP}）",
     )
+    parser.add_argument(
+        "--clusters",
+        type=int,
+        default=None,
+        metavar="K",
+        help="クラスタ数（デフォルト: max(2, round(sqrt(N/2)))）。1で単一クラスタ（クラスタリングなし）。",
+    )
     args = parser.parse_args()
 
     target_dir = Path(args.directory).resolve()
@@ -383,6 +483,8 @@ def main():
         f"  重み         : [cyan]服 {args.weight_torso}[/cyan]  "
         f"[cyan]髪 {args.weight_hair}[/cyan]  [cyan]CLIP {args.weight_clip}[/cyan]"
     )
+    cluster_label = "自動" if args.clusters is None else str(args.clusters)
+    console.print(f"  クラスタ数   : [cyan]{cluster_label}[/cyan]")
     console.print()
 
     # ---- ファイル列挙 ----
@@ -474,11 +576,23 @@ def main():
         ]
     )
 
-    # ---- 順序付け ----
+    # ---- クラスタリング & 順序付け ----
+    n_valid = len(valid_files)
+    if args.clusters is None:
+        k = max(2, round(float(np.sqrt(n_valid / 2))))
+    else:
+        k = args.clusters
+    k = max(1, min(k, n_valid))
+
     console.print()
-    with console.status("[bold green]近傍順序を計算中..."):
-        order = greedy_nearest_neighbor_order(combined)
-    console.print(f"[green]✓[/green] 順序付け完了（{len(order)} 枚）\n")
+    with console.status(f"[bold green]K-means クラスタリング (K={k}) → 順序付け..."):
+        global_order, cluster_sizes = cluster_then_order(combined, k)
+    n_clusters_actual = len(cluster_sizes)
+    console.print(
+        f"[green]✓[/green] クラスタリング完了  "
+        f"[cyan]{n_clusters_actual} クラスタ[/cyan]、"
+        f"並び順での枚数: [cyan]{cluster_sizes}[/cyan]\n"
+    )
 
     # ---- コピー ----
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -486,14 +600,16 @@ def main():
     if no_person:
         no_person_dir.mkdir(exist_ok=True)
 
-    width = max(4, len(str(len(order))))
+    width = max(4, len(str(len(global_order))))
+    cluster_width = max(2, len(str(n_clusters_actual)))
     with make_progress() as progress:
         task = progress.add_task(
-            "[cyan]コピー中...[/cyan]", total=len(order) + len(no_person)
+            "[cyan]コピー中...[/cyan]", total=len(global_order) + len(no_person)
         )
-        for seq, idx in enumerate(order, start=1):
+        for seq, (idx, cluster_id) in enumerate(global_order, start=1):
             src = valid_files[idx]
-            dst = output_dir / f"{seq:0{width}d}_{src.name}"
+            cluster_str = f"c{cluster_id:0{cluster_width}d}"
+            dst = output_dir / f"{seq:0{width}d}_{cluster_str}_{src.name}"
             shutil.copy2(src, dst)
             progress.update(task, advance=1, description=f"[cyan]{dst.name}[/cyan]")
         for src in no_person:
