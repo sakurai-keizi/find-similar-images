@@ -55,6 +55,7 @@ uv run find_similar_images.py /path/to/photos
 |-----------|-----------|------|
 | `--threshold N` | `10` | ハッシュ類似判定の閾値（ハミング距離、0〜64） |
 | `--pose-threshold X` | `0.15` | 姿勢類似度の閾値（胴体長で正規化したL2距離） |
+| `--workers N` | CPUコア数 | ハッシュ計算の並列ワーカー数（`1` で逐次実行） |
 | `--output-dir NAME` | `similar_groups` | 出力ディレクトリ名（入力フォルダ内に作成） |
 | `--dry-run` | — | 移動せずに検出結果だけ表示する |
 
@@ -97,7 +98,15 @@ uv run find_similar_images.py ~/Pictures --pose-threshold 0.25
 
 # 出力先フォルダ名を変更
 uv run find_similar_images.py ~/Pictures --output-dir duplicates
+
+# 並列ワーカー数を明示（デフォルトはCPUコア数。少量画像なら 1 で逐次実行）
+uv run find_similar_images.py ~/Pictures --workers 4
 ```
+
+## パフォーマンス
+
+- **ハッシュ計算**: `ProcessPoolExecutor` でCPUコア数分のプロセスに分散します。32枚以上のときに自動で並列化され、それ未満では起動オーバーヘッドを避けるため逐次実行されます。
+- **類似検索**: 全ペア総当たりではなく **BK-tree** によるハッシュ近傍探索で候補ペアを絞り込み、平均 O(n log n) で動作します。
 
 ## 進捗表示
 

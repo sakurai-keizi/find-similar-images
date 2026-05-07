@@ -32,10 +32,12 @@
 """
 
 import argparse
+import os
 import shutil
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -70,14 +72,21 @@ KP_VIS_THRESHOLD = 0.3
 KP_MIN_VISIBLE = 6
 
 
-def compute_hashes(path: Path) -> "tuple[imagehash.ImageHash, imagehash.ImageHash] | None":
+def compute_hashes(
+    path: Path,
+) -> "tuple[tuple[imagehash.ImageHash, imagehash.ImageHash] | None, str | None]":
+    """画像から (pHash, dHash) を計算する。
+
+    成功時は ((phash, dhash), None)、失敗時は (None, error_message) を返す。
+    ProcessPoolExecutor のワーカーで実行されるため、親の rich.Console には
+    書き込まず、エラーは戻り値で呼び出し側へ返す。
+    """
     try:
         with Image.open(path) as img:
             img = img.convert("RGB")
-            return imagehash.phash(img), imagehash.dhash(img)
+            return (imagehash.phash(img), imagehash.dhash(img)), None
     except Exception as e:
-        console.print(f"[yellow]警告:[/yellow] {path.name} を読み込めませんでした ({e})")
-        return None
+        return None, str(e)
 
 
 def load_pose_model():
@@ -315,6 +324,13 @@ def main():
         help=f"姿勢類似度の閾値（胴体長で正規化したL2距離、デフォルト: {DEFAULT_POSE_THRESHOLD}）",
     )
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        metavar="N",
+        help="ハッシュ計算の並列ワーカー数（デフォルト: CPUコア数、1で逐次実行）",
+    )
+    parser.add_argument(
         "--output-dir",
         default="similar_groups",
         metavar="NAME",
@@ -355,16 +371,38 @@ def main():
     console.print(f"[green]✓[/green] {len(files)} 枚のJPEGファイルを検出しました。\n")
 
     # ---- ハッシュ計算 ----
+    workers = args.workers if args.workers else (os.cpu_count() or 1)
+    use_parallel = workers > 1 and len(files) >= 32
+    results: list = [None] * len(files)
+    errors: list = [None] * len(files)
+
+    with make_progress() as progress:
+        desc = (
+            f"[green]ハッシュ計算中（{workers} workers）...[/green]"
+            if use_parallel
+            else "[green]ハッシュ計算中...[/green]"
+        )
+        task = progress.add_task(desc, total=len(files))
+        if use_parallel:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                fut_to_idx = {ex.submit(compute_hashes, f): i for i, f in enumerate(files)}
+                for fut in as_completed(fut_to_idx):
+                    i = fut_to_idx[fut]
+                    results[i], errors[i] = fut.result()
+                    progress.update(task, advance=1, description=f"[green]{files[i].name}[/green]")
+        else:
+            for i, f in enumerate(files):
+                results[i], errors[i] = compute_hashes(f)
+                progress.update(task, advance=1, description=f"[green]{f.name}[/green]")
+
     hashes = []
     valid_files: list[Path] = []
-    with make_progress() as progress:
-        task = progress.add_task("[green]ハッシュ計算中...[/green]", total=len(files))
-        for f in files:
-            h = compute_hashes(f)
-            progress.update(task, advance=1, description=f"[green]{f.name}[/green]")
-            if h is not None:
-                hashes.append(h)
-                valid_files.append(f)
+    for f, r, err in zip(files, results, errors):
+        if err:
+            console.print(f"[yellow]警告:[/yellow] {f.name} を読み込めませんでした ({err})")
+        if r is not None:
+            hashes.append(r)
+            valid_files.append(f)
 
     skipped = len(files) - len(valid_files)
     console.print(
