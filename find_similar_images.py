@@ -5,17 +5,29 @@
 #   "Pillow>=10.0.0",
 #   "imagehash>=4.3.0",
 #   "rich>=13.0.0",
+#   "ultralytics>=8.0.0",
+#   "numpy>=1.24.0",
 # ]
 # ///
 """
 指定ディレクトリのJPEGファイルを走査し、リサイズ・トリミングされた画像も含めて
 類似画像をグループ化して別フォルダに移動する。
 
+ハッシュ（pHash/dHash）に加えて YOLOv8-pose による姿勢推定も行い、
+ハッシュが近くても姿勢が異なる画像は別グループとして扱う。姿勢ベクトルは
+両腰の中点を原点に、肩-腰の胴体長でスケール正規化するため、リサイズや
+トリミングに対して不変。人物が検出できない画像はハッシュのみで判定する。
+
 閾値の目安（--threshold）:
   0-5  : ほぼ同一ファイル（JPEG再圧縮程度の差）
   6-10 : リサイズ・画質変換された同じ画像（デフォルト）
  11-20 : 軽度のトリミングや色調補正を含む類似画像
  21-30 : 重度のトリミングや加工も含む（誤検知が増える）
+
+姿勢閾値の目安（--pose-threshold、胴体長で正規化したL2距離）:
+  0.10 以下 : ほぼ同じ姿勢
+  0.15      : デフォルト（ほぼ同じ姿勢のみ許容）
+  0.25 以上 : 姿勢の違いに寛容（誤検知が増える）
 """
 
 import argparse
@@ -25,6 +37,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 import imagehash
 from rich.console import Console
@@ -44,6 +57,15 @@ from rich.table import Table
 
 console = Console()
 DEFAULT_THRESHOLD = 10
+DEFAULT_POSE_THRESHOLD = 0.15
+
+# COCO 17キーポイントのインデックス
+KP_LEFT_SHOULDER = 5
+KP_RIGHT_SHOULDER = 6
+KP_LEFT_HIP = 11
+KP_RIGHT_HIP = 12
+KP_VIS_THRESHOLD = 0.3
+KP_MIN_VISIBLE = 6
 
 
 def compute_hashes(path: Path) -> "tuple[imagehash.ImageHash, imagehash.ImageHash] | None":
@@ -54,6 +76,66 @@ def compute_hashes(path: Path) -> "tuple[imagehash.ImageHash, imagehash.ImageHas
     except Exception as e:
         console.print(f"[yellow]警告:[/yellow] {path.name} を読み込めませんでした ({e})")
         return None
+
+
+def load_pose_model():
+    from ultralytics import YOLO
+    return YOLO("yolov8n-pose.pt")
+
+
+def compute_pose_feature(model, path: Path) -> "tuple[np.ndarray, np.ndarray] | None":
+    """画像から姿勢特徴ベクトルを抽出する。
+
+    両腰の中点を原点に、肩-腰の胴体長でスケール正規化した
+    17点の (x, y) 座標と、各点の信頼度を返す。
+    人物が検出できない / 胴体のキーポイントが不可視の場合は None。
+    """
+    try:
+        results = model(str(path), verbose=False)
+    except Exception as e:
+        console.print(f"[yellow]警告:[/yellow] {path.name} の姿勢推定に失敗しました ({e})")
+        return None
+    if not results:
+        return None
+    r = results[0]
+    if r.boxes is None or len(r.boxes) == 0:
+        return None
+    if r.keypoints is None or r.keypoints.data is None or len(r.keypoints.data) == 0:
+        return None
+
+    confs = r.boxes.conf.cpu().numpy()
+    best = int(confs.argmax())
+    kpts = r.keypoints.data[best].cpu().numpy()  # (17, 3): x, y, visibility
+    xy = kpts[:, :2]
+    vis = kpts[:, 2]
+
+    anchor_vis = min(
+        vis[KP_LEFT_SHOULDER], vis[KP_RIGHT_SHOULDER],
+        vis[KP_LEFT_HIP], vis[KP_RIGHT_HIP],
+    )
+    if anchor_vis < KP_VIS_THRESHOLD:
+        return None
+
+    shoulder_mid = (xy[KP_LEFT_SHOULDER] + xy[KP_RIGHT_SHOULDER]) / 2
+    hip_mid = (xy[KP_LEFT_HIP] + xy[KP_RIGHT_HIP]) / 2
+    torso = float(np.linalg.norm(shoulder_mid - hip_mid))
+    if torso < 1e-6:
+        return None
+
+    normalized = (xy - hip_mid) / torso
+    return normalized.astype(np.float32), vis.astype(np.float32)
+
+
+def pose_distance(p1, p2) -> float:
+    if p1 is None or p2 is None:
+        return float("inf")
+    xy1, v1 = p1
+    xy2, v2 = p2
+    mask = (v1 > KP_VIS_THRESHOLD) & (v2 > KP_VIS_THRESHOLD)
+    if int(mask.sum()) < KP_MIN_VISIBLE:
+        return float("inf")
+    diff = xy1[mask] - xy2[mask]
+    return float(np.sqrt((diff ** 2).sum(axis=1)).mean())
 
 
 def find_jpeg_files(directory: Path, exclude_prefix: str) -> list[Path]:
@@ -87,11 +169,17 @@ class UnionFind:
             self.rank[rx] += 1
 
 
-def is_similar(h1, h2, threshold: int) -> bool:
-    return (h1[0] - h2[0]) <= threshold or (h1[1] - h2[1]) <= threshold
+def is_similar(h1, h2, p1, p2, hash_threshold: int, pose_threshold: float) -> bool:
+    hash_match = (h1[0] - h2[0]) <= hash_threshold or (h1[1] - h2[1]) <= hash_threshold
+    if not hash_match:
+        return False
+    # 片方でも人物が検出できなければハッシュのみで判定（フォールバック）
+    if p1 is None or p2 is None:
+        return True
+    return pose_distance(p1, p2) <= pose_threshold
 
 
-def group_similar_images(files, hashes, threshold: int, progress, task_id):
+def group_similar_images(files, hashes, poses, hash_threshold: int, pose_threshold: float, progress, task_id):
     n = len(files)
     uf = UnionFind(n)
     total_pairs = n * (n - 1) // 2
@@ -99,7 +187,7 @@ def group_similar_images(files, hashes, threshold: int, progress, task_id):
 
     for i in range(n):
         for j in range(i + 1, n):
-            if is_similar(hashes[i], hashes[j], threshold):
+            if is_similar(hashes[i], hashes[j], poses[i], poses[j], hash_threshold, pose_threshold):
                 uf.union(i, j)
             done += 1
         progress.update(task_id, completed=done, total=total_pairs)
@@ -203,6 +291,13 @@ def main():
         help=f"類似判定の閾値（ハミング距離 0〜64、デフォルト: {DEFAULT_THRESHOLD}）",
     )
     parser.add_argument(
+        "--pose-threshold",
+        type=float,
+        default=DEFAULT_POSE_THRESHOLD,
+        metavar="X",
+        help=f"姿勢類似度の閾値（胴体長で正規化したL2距離、デフォルト: {DEFAULT_POSE_THRESHOLD}）",
+    )
+    parser.add_argument(
         "--output-dir",
         default="similar_groups",
         metavar="NAME",
@@ -225,7 +320,8 @@ def main():
 
     console.rule("[bold]類似画像検出")
     console.print(f"  対象フォルダ : [cyan]{target_dir}[/cyan]")
-    console.print(f"  閾値         : [cyan]{args.threshold}[/cyan]")
+    console.print(f"  ハッシュ閾値 : [cyan]{args.threshold}[/cyan]")
+    console.print(f"  姿勢閾値     : [cyan]{args.pose_threshold}[/cyan]")
     console.print(f"  出力先       : [cyan]{output_dir}[/cyan]")
     if args.dry_run:
         console.print("  モード       : [yellow]DRY-RUN（移動しない）[/yellow]")
@@ -259,6 +355,28 @@ def main():
         + (f"  [yellow]（{skipped} 枚スキップ）[/yellow]" if skipped else "")
     )
 
+    # ---- 姿勢推定 ----
+    console.print()
+    with console.status("[bold green]YOLOv8-pose モデルを読み込み中..."):
+        pose_model = load_pose_model()
+
+    poses: list = []
+    pose_count = 0
+    with make_progress() as progress:
+        task = progress.add_task("[magenta]姿勢推定中...[/magenta]", total=len(valid_files))
+        for f in valid_files:
+            p = compute_pose_feature(pose_model, f)
+            progress.update(task, advance=1, description=f"[magenta]{f.name}[/magenta]")
+            poses.append(p)
+            if p is not None:
+                pose_count += 1
+
+    console.print(
+        f"\n[green]✓[/green] 姿勢推定完了  "
+        f"[cyan]{pose_count}/{len(valid_files)}[/cyan] 枚で人物を検出"
+        f"  [dim]（未検出はハッシュのみで判定）[/dim]"
+    )
+
     # ---- 類似検索 ----
     console.print()
     n = len(valid_files)
@@ -266,10 +384,12 @@ def main():
     groups: dict[int, list[int]] = {}
     with make_progress() as progress:
         task = progress.add_task(
-            f"[blue]類似検索中（閾値 {args.threshold}）...[/blue]",
+            f"[blue]類似検索中（ハッシュ {args.threshold} / 姿勢 {args.pose_threshold}）...[/blue]",
             total=total_pairs,
         )
-        groups = group_similar_images(valid_files, hashes, args.threshold, progress, task)
+        groups = group_similar_images(
+            valid_files, hashes, poses, args.threshold, args.pose_threshold, progress, task
+        )
 
     if not groups:
         console.print("\n[yellow]類似画像のグループは見つかりませんでした。[/yellow]")
