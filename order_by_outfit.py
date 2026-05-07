@@ -115,8 +115,10 @@ def load_pose_model():
 
 def load_clip_model():
     import open_clip
+    # OpenAI CLIP は元々 QuickGELU で学習されているため、警告回避のため
+    # 明示的に -quickgelu バリアントを指定する。
     model, _, preprocess = open_clip.create_model_and_transforms(
-        "ViT-B-32", pretrained="openai"
+        "ViT-B-32-quickgelu", pretrained="openai"
     )
     model.eval()
     return model, preprocess
@@ -619,7 +621,7 @@ def main():
 
     elapsed = time.monotonic() - t_start
     console.rule()
-    summary = f"[bold green]完了:[/bold green] {len(order)} 枚を順序付けてコピー"
+    summary = f"[bold green]完了:[/bold green] {len(global_order)} 枚を順序付けてコピー"
     if no_person:
         summary += f"、[yellow]{len(no_person)}[/yellow] 枚を _no_person/ にコピー"
     summary += f"  [dim]({elapsed:.1f}s)[/dim]"
