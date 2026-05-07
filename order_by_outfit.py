@@ -33,8 +33,9 @@ YOLOv8-pose で胴体・頭部・人物bboxを検出する。胴体は両肩+両
 
 新しいファイル名は `{順序番号:04d}_c{クラスタID:02d}_{元のファイル名}` の形式。
 クラスタIDは並び順での通し番号（c01 が並び順の最初のクラスタ）。
-人物が検出できなかった画像は出力フォルダ内の `_no_person/` に元の名前のまま
-コピーされる。元のファイルは変更されない（コピーのみ）。
+人物が検出できなかった画像は通し番号を継続したまま末尾に
+`{順序番号:04d}_{元のファイル名}` 形式（クラスタIDなし）で同じ階層に配置される。
+元のファイルは変更されない（コピーのみ）。
 
 初回実行時に YOLOv8-pose（~6MB）と CLIP ViT-B/32（~150MB）の重みが自動
 ダウンロードされる。
@@ -598,24 +599,21 @@ def main():
 
     # ---- コピー ----
     output_dir.mkdir(parents=True, exist_ok=True)
-    no_person_dir = output_dir / "_no_person"
-    if no_person:
-        no_person_dir.mkdir(exist_ok=True)
 
-    width = max(4, len(str(len(global_order))))
+    total_count = len(global_order) + len(no_person)
+    width = max(4, len(str(total_count)))
     cluster_width = max(2, len(str(n_clusters_actual)))
     with make_progress() as progress:
-        task = progress.add_task(
-            "[cyan]コピー中...[/cyan]", total=len(global_order) + len(no_person)
-        )
+        task = progress.add_task("[cyan]コピー中...[/cyan]", total=total_count)
         for seq, (idx, cluster_id) in enumerate(global_order, start=1):
             src = valid_files[idx]
             cluster_str = f"c{cluster_id:0{cluster_width}d}"
             dst = output_dir / f"{seq:0{width}d}_{cluster_str}_{src.name}"
             shutil.copy2(src, dst)
             progress.update(task, advance=1, description=f"[cyan]{dst.name}[/cyan]")
-        for src in no_person:
-            dst = no_person_dir / src.name
+        for offset, src in enumerate(no_person, start=1):
+            seq = len(global_order) + offset
+            dst = output_dir / f"{seq:0{width}d}_{src.name}"
             shutil.copy2(src, dst)
             progress.update(task, advance=1, description=f"[cyan]{dst.name}[/cyan]")
 
@@ -623,7 +621,7 @@ def main():
     console.rule()
     summary = f"[bold green]完了:[/bold green] {len(global_order)} 枚を順序付けてコピー"
     if no_person:
-        summary += f"、[yellow]{len(no_person)}[/yellow] 枚を _no_person/ にコピー"
+        summary += f"、[yellow]{len(no_person)}[/yellow] 枚を末尾にコピー"
     summary += f"  [dim]({elapsed:.1f}s)[/dim]"
     console.print(summary)
     console.print(
