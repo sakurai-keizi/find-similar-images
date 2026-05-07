@@ -13,8 +13,10 @@
 新しい名前で別フォルダにコピーするツール。
 
 YOLOv8-pose で人物の胴体領域（両肩〜両腰の矩形）を検出し、その領域の
-HSV色ヒストグラムを服装の特徴量として利用する。貪欲法の最近傍順序付け
-（NN-TSP）で1次元の順序を決定し、隣り合う画像が似た服装になるよう配置する。
+HSV色ヒストグラムを服装の特徴量として利用する。腰が映っていない上半身
+ショットでは、両肩が可視なら肩幅を基準に下方向 1.5×肩幅 の矩形を
+胴体領域として推定する。貪欲法の最近傍順序付け（NN-TSP）で1次元の順序
+を決定し、隣り合う画像が似た服装になるよう配置する。
 
 新しいファイル名は `{順序番号:04d}_{元のファイル名}` の形式。
 人物が検出できなかった画像は出力フォルダ内の `_no_person/` に元の名前のまま
@@ -87,7 +89,11 @@ def load_pose_model():
 
 
 def detect_torso_bbox(model, path: Path) -> "tuple[float, float, float, float] | None":
-    """画像から人物の胴体 bbox (x1, y1, x2, y2) を返す。検出失敗時は None。"""
+    """画像から人物の胴体 bbox (x1, y1, x2, y2) を返す。検出失敗時は None。
+
+    両肩 + 両腰の4点が可視ならその矩形を返す。腰が映っていない上半身ショット
+    では、両肩が可視なら肩幅を基準に下方向 1.5×肩幅 の矩形を推定して返す。
+    """
     try:
         results = model(str(path), verbose=False)
     except Exception as e:
@@ -107,16 +113,35 @@ def detect_torso_bbox(model, path: Path) -> "tuple[float, float, float, float] |
     xy = kpts[:, :2]
     vis = kpts[:, 2]
 
-    anchor_vis = min(
-        vis[KP_LEFT_SHOULDER], vis[KP_RIGHT_SHOULDER],
-        vis[KP_LEFT_HIP], vis[KP_RIGHT_HIP],
+    shoulders_visible = (
+        vis[KP_LEFT_SHOULDER] >= KP_VIS_THRESHOLD
+        and vis[KP_RIGHT_SHOULDER] >= KP_VIS_THRESHOLD
     )
-    if anchor_vis < KP_VIS_THRESHOLD:
-        return None
+    hips_visible = (
+        vis[KP_LEFT_HIP] >= KP_VIS_THRESHOLD
+        and vis[KP_RIGHT_HIP] >= KP_VIS_THRESHOLD
+    )
 
-    xs = [xy[i, 0] for i in (KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER, KP_LEFT_HIP, KP_RIGHT_HIP)]
-    ys = [xy[i, 1] for i in (KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER, KP_LEFT_HIP, KP_RIGHT_HIP)]
-    return float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))
+    if shoulders_visible and hips_visible:
+        # 両肩+両腰の4点で囲む矩形（最も精度が高い）
+        xs = [xy[i, 0] for i in (KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER, KP_LEFT_HIP, KP_RIGHT_HIP)]
+        ys = [xy[i, 1] for i in (KP_LEFT_SHOULDER, KP_RIGHT_SHOULDER, KP_LEFT_HIP, KP_RIGHT_HIP)]
+        return float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys))
+
+    if shoulders_visible:
+        # 上半身ショット: 肩幅を基準に下方向 1.5×肩幅 の矩形を推定
+        ls = xy[KP_LEFT_SHOULDER]
+        rs = xy[KP_RIGHT_SHOULDER]
+        shoulder_width = float(np.linalg.norm(ls - rs))
+        if shoulder_width < 4:
+            return None
+        x1 = float(min(ls[0], rs[0]))
+        x2 = float(max(ls[0], rs[0]))
+        y_top = float(min(ls[1], rs[1]))
+        y_bot = y_top + 1.5 * shoulder_width
+        return x1, y_top, x2, y_bot
+
+    return None
 
 
 def compute_torso_histogram(path: Path, bbox) -> "np.ndarray | None":
