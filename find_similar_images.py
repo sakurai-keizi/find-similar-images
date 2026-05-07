@@ -7,6 +7,7 @@
 #   "rich>=13.0.0",
 #   "ultralytics>=8.0.0",
 #   "numpy>=1.24.0",
+#   "pybktree>=1.1",
 # ]
 # ///
 """
@@ -38,6 +39,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
+import pybktree
 from PIL import Image
 import imagehash
 from rich.console import Console
@@ -182,15 +184,31 @@ def is_similar(h1, h2, p1, p2, hash_threshold: int, pose_threshold: float) -> bo
 def group_similar_images(files, hashes, poses, hash_threshold: int, pose_threshold: float, progress, task_id):
     n = len(files)
     uf = UnionFind(n)
-    total_pairs = n * (n - 1) // 2
-    done = 0
 
+    # ハッシュ距離が threshold 以下の候補ペアを BK-tree で絞り込んでから
+    # 姿勢距離をチェックする（総当たり O(n²) → 平均 O(n log n)）。
+    def phash_dist(i: int, j: int) -> int:
+        return int(hashes[i][0] - hashes[j][0])
+
+    def dhash_dist(i: int, j: int) -> int:
+        return int(hashes[i][1] - hashes[j][1])
+
+    ptree = pybktree.BKTree(phash_dist, list(range(n)))
+    dtree = pybktree.BKTree(dhash_dist, list(range(n)))
+
+    progress.update(task_id, total=n)
     for i in range(n):
-        for j in range(i + 1, n):
+        candidates: set[int] = set()
+        for _, j in ptree.find(i, hash_threshold):
+            candidates.add(j)
+        for _, j in dtree.find(i, hash_threshold):
+            candidates.add(j)
+        for j in candidates:
+            if j <= i:
+                continue
             if is_similar(hashes[i], hashes[j], poses[i], poses[j], hash_threshold, pose_threshold):
                 uf.union(i, j)
-            done += 1
-        progress.update(task_id, completed=done, total=total_pairs)
+        progress.update(task_id, advance=1)
 
     groups: dict[int, list[int]] = defaultdict(list)
     for i in range(n):
@@ -254,8 +272,7 @@ def move_groups(files, groups, output_dir: Path, dry_run: bool) -> int:
             "[cyan]移動中...[/cyan]" if not dry_run else "[yellow]確認中...[/yellow]",
             total=total,
         )
-        for _, members in sorted(groups.items()):
-            group_num = sorted(groups.keys()).index(_) + 1
+        for group_num, (_, members) in enumerate(sorted(groups.items()), start=1):
             group_dir = output_dir / f"group_{group_num:04d}"
             if not dry_run:
                 group_dir.mkdir(exist_ok=True)
@@ -379,13 +396,11 @@ def main():
 
     # ---- 類似検索 ----
     console.print()
-    n = len(valid_files)
-    total_pairs = n * (n - 1) // 2
     groups: dict[int, list[int]] = {}
     with make_progress() as progress:
         task = progress.add_task(
             f"[blue]類似検索中（ハッシュ {args.threshold} / 姿勢 {args.pose_threshold}）...[/blue]",
-            total=total_pairs,
+            total=len(valid_files),
         )
         groups = group_similar_images(
             valid_files, hashes, poses, args.threshold, args.pose_threshold, progress, task
