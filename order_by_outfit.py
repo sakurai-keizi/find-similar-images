@@ -43,7 +43,8 @@ CLIP モデルは --clip-model で選択可能:
 最近傍順序付け（NN-TSP）でクラスタ間を空間的に近い順に並べ、さらに
 各クラスタ内でも同じく NN 順序付けを行う。これにより「似たクラスタが
 隣接し、各クラスタ内でも似た画像が隣接する」2段の順序が得られる。
-クラスタ数は --clusters で指定可能（デフォルトは max(2, round(sqrt(N/2)))）。
+クラスタ数は --clusters で指定可能。指定しない場合は K=2..min(20, N//5)
+の範囲で K-means を試行し、シルエット係数が最も高い K を自動採用する。
 
 新しいファイル名は `{順序番号:04d}_c{クラスタID:02d}_{元のファイル名}` の形式。
 クラスタIDは並び順での通し番号（c01 が並び順の最初のクラスタ）。
@@ -522,6 +523,80 @@ def kmeans(
     return labels, centers
 
 
+def silhouette_from_distance(dist: np.ndarray, labels: np.ndarray) -> float:
+    """事前計算済みのペアワイズ距離行列とラベルから平均シルエット係数を計算する。
+
+    各点 i について、同クラスタ内の他点までの平均距離 a(i) と、最も近い他クラスタ
+    までの平均距離 b(i) から s(i) = (b - a) / max(a, b) を求め、その平均を返す。
+    -1〜1 の範囲。1 に近いほど良いクラスタリング。
+    """
+    n = len(labels)
+    unique = np.unique(labels)
+    k = len(unique)
+    if k < 2 or k >= n:
+        return -1.0
+
+    s_sum = 0.0
+    s_count = 0
+    for i in range(n):
+        own = labels[i]
+        same = labels == own
+        same[i] = False
+        if not same.any():
+            continue
+        a = float(dist[i, same].mean())
+        b = float("inf")
+        for c in unique:
+            if c == own:
+                continue
+            other = labels == c
+            d = float(dist[i, other].mean())
+            if d < b:
+                b = d
+        denom = max(a, b)
+        if denom > 0:
+            s_sum += (b - a) / denom
+            s_count += 1
+    return s_sum / s_count if s_count > 0 else 0.0
+
+
+def auto_select_k(
+    features: np.ndarray,
+    k_min: int = 2,
+    k_max: "int | None" = None,
+    progress_cb=None,
+) -> "tuple[int, float, list[tuple[int, float]]]":
+    """K の範囲でクラスタリングを試し、シルエット係数が最大の K を返す。
+
+    Returns:
+        (best_k, best_score, all_scores)
+        all_scores は [(k, score), ...] のリスト。
+    """
+    n = features.shape[0]
+    if k_max is None:
+        k_max = min(20, max(k_min, n // 5))
+    k_max = min(k_max, n - 1)
+    if k_max < k_min:
+        return max(1, k_min), 0.0, []
+
+    # ペアワイズ距離は K に依存しないので一度だけ計算する
+    dist = np.linalg.norm(features[:, None, :] - features[None, :, :], axis=2)
+
+    scores: list = []
+    best_k = k_min
+    best_score = -np.inf
+    for k in range(k_min, k_max + 1):
+        labels, _ = kmeans(features, k)
+        s = silhouette_from_distance(dist, labels)
+        scores.append((k, s))
+        if s > best_score:
+            best_score = s
+            best_k = k
+        if progress_cb is not None:
+            progress_cb(k, s)
+    return best_k, best_score, scores
+
+
 def cluster_then_order(
     features: np.ndarray, k: int
 ) -> "tuple[list[tuple[int, int]], list[int]]":
@@ -593,7 +668,7 @@ def main():
         type=int,
         default=None,
         metavar="K",
-        help="クラスタ数（デフォルト: max(2, round(sqrt(N/2)))）。1で単一クラスタ（クラスタリングなし）。",
+        help="クラスタ数。指定しない場合は K=2..min(20, N//5) の範囲でシルエット係数が最大の K を自動採用する。1 で単一クラスタ（クラスタリングなし）。",
     )
     parser.add_argument(
         "--clip-model",
@@ -760,7 +835,37 @@ def main():
     # ---- クラスタリング & 順序付け ----
     n_valid = len(valid_files)
     if args.clusters is None:
-        k = max(2, round(float(np.sqrt(n_valid / 2))))
+        k_min = 2
+        k_max = min(20, max(k_min, n_valid // 5))
+        k_max = min(k_max, n_valid - 1)
+        if k_max >= k_min:
+            console.print()
+            with make_progress() as progress:
+                task = progress.add_task(
+                    "[blue]最適クラスタ数を探索中（silhouette）...[/blue]",
+                    total=k_max - k_min + 1,
+                )
+
+                def cb(k_val, score):
+                    progress.update(
+                        task, advance=1,
+                        description=f"[blue]K={k_val} silhouette={score:.3f}[/blue]",
+                    )
+
+                best_k, best_score, all_scores = auto_select_k(
+                    combined, k_min=k_min, k_max=k_max, progress_cb=cb,
+                )
+            top3 = ", ".join(
+                f"K={k_val}={s:.3f}"
+                for k_val, s in sorted(all_scores, key=lambda x: -x[1])[:3]
+            )
+            console.print(
+                f"\n[green]✓[/green] 自動選択: [cyan]K={best_k}[/cyan]  "
+                f"silhouette=[cyan]{best_score:.3f}[/cyan]  [dim]上位3: {top3}[/dim]"
+            )
+            k = best_k
+        else:
+            k = max(1, n_valid)
     else:
         k = args.clusters
     k = max(1, min(k, n_valid))
