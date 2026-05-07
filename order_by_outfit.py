@@ -18,9 +18,14 @@
   - 頭部領域のHSV色ヒストグラム（髪色）
   - CLIP（ViT-B/32）画像埋め込み（服の種類・髪型などの意味的特徴）
 
-YOLOv8-pose で胴体・頭部・人物bboxを検出する。胴体は両肩+両腰の4点、または
-両肩のみで上半身を推定。頭部は両目+両耳から推定。CLIPは人物bbox全体に適用
-し、服の種類（制服、スカート、水着など）や髪型のスタイルを意味的に捉える。
+YOLOv8-pose で胴体・頭部の領域を検出する。胴体は両肩+両腰の4点、または両肩
+のみで上半身を推定。頭部は両目+両耳から推定。
+
+CLIP に渡す前に YOLOv8-seg で人物セグメンテーションマスクを生成し、人物以外
+のピクセルを中性色（グレー）に置き換える。これにより背景の影響を最小化し、
+服の種類（制服、スカート、水着など）や髪型のスタイルといった意味的特徴に
+集中できる。マスク取得に失敗した場合は人物 bbox でクロップしただけの画像で
+フォールバックする。
 
 3つの特徴ベクトルを各々 L2 正規化した上で重み付きで連結する。重みは
 --weight-torso / --weight-hair / --weight-clip で調整可能。
@@ -37,8 +42,8 @@ YOLOv8-pose で胴体・頭部・人物bboxを検出する。胴体は両肩+両
 `{順序番号:04d}_{元のファイル名}` 形式（クラスタIDなし）で同じ階層に配置される。
 元のファイルは変更されない（コピーのみ）。
 
-初回実行時に YOLOv8-pose（~6MB）と CLIP ViT-B/32（~150MB）の重みが自動
-ダウンロードされる。
+初回実行時に YOLOv8-pose（~6MB）、YOLOv8-seg（~7MB）、CLIP ViT-B/32（~150MB）
+の重みが自動ダウンロードされる。
 """
 
 import argparse
@@ -112,6 +117,11 @@ def make_progress() -> Progress:
 def load_pose_model():
     from ultralytics import YOLO
     return YOLO("yolov8n-pose.pt")
+
+
+def load_seg_model():
+    from ultralytics import YOLO
+    return YOLO("yolov8n-seg.pt")
 
 
 def load_clip_model():
@@ -261,12 +271,42 @@ def compute_region_histogram(
     return hist
 
 
-def compute_clip_embedding(
-    model, preprocess, img_rgb: Image.Image, bbox: "tuple[float, float, float, float]"
-) -> "np.ndarray | None":
-    """人物 bbox にクロップした画像を CLIP に通して L2 正規化済み埋め込みを返す。"""
-    import torch
+def compute_person_mask(
+    seg_model, path: Path
+) -> "tuple[np.ndarray | None, tuple[float, float, float, float] | None]":
+    """画像から人物セグメンテーションマスクと bbox を返す。検出失敗時は (None, None)。"""
+    try:
+        results = seg_model(str(path), classes=[0], verbose=False)
+    except Exception as e:
+        console.print(f"[yellow]警告:[/yellow] {path.name} のセグメンテーションに失敗 ({e})")
+        return None, None
+    if not results:
+        return None, None
+    r = results[0]
+    if r.boxes is None or len(r.boxes) == 0:
+        return None, None
+    if r.masks is None or r.masks.data is None or len(r.masks.data) == 0:
+        return None, None
+    confs = r.boxes.conf.cpu().numpy()
+    best = int(confs.argmax())
+    mask = r.masks.data[best].cpu().numpy().astype(bool)
+    person_xyxy = r.boxes.xyxy[best].cpu().numpy()
+    bbox = (
+        float(person_xyxy[0]),
+        float(person_xyxy[1]),
+        float(person_xyxy[2]),
+        float(person_xyxy[3]),
+    )
+    return mask, bbox
 
+
+def prepare_clip_crop(
+    img_rgb: Image.Image,
+    bbox: "tuple[float, float, float, float]",
+    mask: "np.ndarray | None" = None,
+    fill: "tuple[int, int, int]" = (128, 128, 128),
+) -> "Image.Image | None":
+    """画像を bbox でクロップする。mask が与えられていれば人物以外を中性色で塗りつぶしてからクロップ。"""
     x1, y1, x2, y2 = (int(round(v)) for v in bbox)
     x1 = max(0, x1)
     y1 = max(0, y1)
@@ -274,10 +314,32 @@ def compute_clip_embedding(
     y2 = min(img_rgb.height, y2)
     if x2 - x1 < 4 or y2 - y1 < 4:
         return None
-    crop = img_rgb.crop((x1, y1, x2, y2))
+
+    if mask is None:
+        return img_rgb.crop((x1, y1, x2, y2))
+
+    arr = np.array(img_rgb)  # (H, W, 3) uint8
+    img_h, img_w = arr.shape[:2]
+
+    # ultralytics のマスクは入力解像度のことがあるので、画像サイズに揃える
+    if mask.shape != (img_h, img_w):
+        mask_pil = Image.fromarray((mask.astype(np.uint8)) * 255)
+        mask_pil = mask_pil.resize((img_w, img_h), Image.NEAREST)
+        mask = np.asarray(mask_pil) > 127
+
+    arr[~mask] = fill
+    return Image.fromarray(arr).crop((x1, y1, x2, y2))
+
+
+def compute_clip_embedding(
+    model, preprocess, crop_pil: Image.Image
+) -> "np.ndarray | None":
+    """事前にクロップ済みの PIL 画像を CLIP に通して L2 正規化済み埋め込みを返す。"""
+    import torch
+
     try:
         with torch.no_grad():
-            tensor = preprocess(crop).unsqueeze(0)
+            tensor = preprocess(crop_pil).unsqueeze(0)
             feat = model.encode_image(tensor)
             feat = feat / feat.norm(dim=-1, keepdim=True)
         return feat.cpu().numpy().flatten().astype(np.float32)
@@ -501,6 +563,8 @@ def main():
     # ---- モデルロード ----
     with console.status("[bold green]YOLOv8-pose モデルを読み込み中..."):
         pose_model = load_pose_model()
+    with console.status("[bold green]YOLOv8-seg モデルを読み込み中..."):
+        seg_model = load_seg_model()
     with console.status("[bold green]CLIP モデルを読み込み中（初回はDLあり、~150MB）..."):
         clip_model, clip_preprocess = load_clip_model()
 
@@ -510,17 +574,22 @@ def main():
     no_person: list[Path] = []
     hair_count = 0
     clip_count = 0
+    mask_count = 0
 
     with make_progress() as progress:
         task = progress.add_task(
-            "[magenta]特徴抽出中（YOLO+CLIP）...[/magenta]", total=len(files)
+            "[magenta]特徴抽出中（YOLO pose + seg + CLIP）...[/magenta]", total=len(files)
         )
         for f in files:
-            torso_bbox, hair_bbox, person_bbox = detect_bboxes(pose_model, f)
+            torso_bbox, hair_bbox, pose_person_bbox = detect_bboxes(pose_model, f)
             if torso_bbox is None:
                 no_person.append(f)
                 progress.update(task, advance=1, description=f"[magenta]{f.name}[/magenta]")
                 continue
+
+            person_mask, seg_bbox = compute_person_mask(seg_model, f)
+            # マスク取得成功なら seg の bbox を、失敗なら pose の bbox を CLIP 入力に使う
+            clip_bbox = seg_bbox if seg_bbox is not None else pose_person_bbox
 
             torso_hist = None
             hair_hist = None
@@ -531,10 +600,12 @@ def main():
                     torso_hist = compute_region_histogram(img_rgb, torso_bbox)
                     if hair_bbox is not None:
                         hair_hist = compute_region_histogram(img_rgb, hair_bbox)
-                    if person_bbox is not None:
-                        clip_emb = compute_clip_embedding(
-                            clip_model, clip_preprocess, img_rgb, person_bbox
-                        )
+                    if clip_bbox is not None:
+                        clip_crop = prepare_clip_crop(img_rgb, clip_bbox, mask=person_mask)
+                        if clip_crop is not None:
+                            clip_emb = compute_clip_embedding(
+                                clip_model, clip_preprocess, clip_crop
+                            )
             except Exception as e:
                 console.print(f"[yellow]警告:[/yellow] {f.name} 特徴抽出に失敗 ({e})")
                 no_person.append(f)
@@ -550,6 +621,8 @@ def main():
                 hair_count += 1
             if clip_emb is not None:
                 clip_count += 1
+            if person_mask is not None:
+                mask_count += 1
             feature_records.append((torso_hist, hair_hist, clip_emb))
             valid_files.append(f)
             progress.update(task, advance=1, description=f"[magenta]{f.name}[/magenta]")
@@ -558,7 +631,7 @@ def main():
         f"\n[green]✓[/green] 特徴抽出完了  "
         f"[cyan]{len(valid_files)}/{len(files)}[/cyan] 枚で胴体検出"
         f"  [cyan]({hair_count} 枚で髪領域も)[/cyan]"
-        f"  [cyan]({clip_count} 枚でCLIP)[/cyan]"
+        f"  [cyan]({clip_count} 枚でCLIP、うち {mask_count} 枚でマスク適用)[/cyan]"
     )
     if no_person:
         detect_summary += f"  [yellow]（{len(no_person)} 枚は人物未検出）[/yellow]"
